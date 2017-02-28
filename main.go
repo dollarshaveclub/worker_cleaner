@@ -3,18 +3,18 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
+	redis "gopkg.in/redis.v4"
+
 	"github.com/pkg/errors"
-	"github.com/wearemolecule/worker_cleaner/pkg/kubeconfig"
-	"gopkg.in/redis.v4"
-	kube_util "k8s.io/contrib/cluster-autoscaler/utils/kubernetes"
-	kube_client "k8s.io/kubernetes/pkg/client/unversioned"
+	"k8s.io/client-go/1.5/kubernetes"
+	"k8s.io/client-go/1.5/pkg/api"
+	"k8s.io/client-go/1.5/tools/clientcmd"
 )
 
 const (
@@ -32,103 +32,95 @@ var (
 	namespace               string
 	podRoleSelector         string
 	podAppSelector          string
-	kube                    string
+	run                     string
+	matchPrefix             string
 )
 
 func init() {
-	flag.Parse()
 	blacklistedResqueQueues = strings.Split(os.Getenv("BLACKLISTED_QUEUES"), ",")
 	namespace = os.Getenv("NAMESPACE")
-	podRoleSelector = os.Getenv("POD_ROLE")
 	podAppSelector = os.Getenv("POD_APP")
-	kube = os.Getenv("KUBE")
+	run = os.Getenv("RUN")
+	matchPrefix = os.Getenv("MATCH_PREFIX")
 }
 
 func main() {
-	glog.V(0).Info("Kubernetes-Resque Worker Cleanup Service")
+	log.Printf("info - " + "Kubernetes-Resque Worker Cleanup Service")
 
 	kubeClient, err := getKubernetesClient()
 	if err != nil {
-		glog.Fatal(errors.Wrap(err, "Unable to create kubernetes client").Error())
+		log.Fatalf(errors.Wrap(err, "Unable to create kubernetes client").Error())
 	}
-	podLister := kube_util.NewScheduledPodLister(kubeClient)
 	redisClient := getRedisClient()
 
-	ticker := time.NewTicker(time.Minute * 5)
-	defer ticker.Stop()
+	log.Printf("info - "+"starting cleanup at %v...", time.Now())
 
-	for _ = range ticker.C {
-		glog.V(1).Infof("starting cleanup at %v...", time.Now())
+	kubernetesWorkers, err := getWorkersFromKubernetes(namespace, kubeClient)
+	if err != nil {
+		log.Fatalf(errors.Wrap(err, "Unable to get workers from kubernetes").Error())
 
-		kubernetesWorkers, err := getWorkersFromKubernetes(podLister)
-		if err != nil {
-			glog.Warning(errors.Wrap(err, "Unable to get workers from kubernetes").Error())
-			continue
-		}
+	}
 
-		redisWorkers, err := getWorkersFromRedis(redisClient)
-		if err != nil {
-			glog.Warning(errors.Wrap(err, "Unable to get workers from redis").Error())
-			continue
-		}
+	redisWorkers, err := getWorkersFromRedis(redisClient)
+	if err != nil {
+		log.Fatalf(errors.Wrap(err, "Unable to get workers from redis").Error())
+	}
 
-		deadRedisWorkers := redisWorkersNotInKubernetes(redisWorkers, kubernetesWorkers)
+	deadRedisWorkers := redisWorkersNotInKubernetes(redisWorkers, kubernetesWorkers)
 
-		glog.V(2).Infof("Found %d kubernetes workers", len(kubernetesWorkers))
-		glog.V(2).Info(kubernetesWorkers)
+	log.Printf("info - "+"Found %d kubernetes workers", len(kubernetesWorkers))
+	log.Printf("info - "+"Found %d redis workers", len(redisWorkers))
+	log.Printf("info - "+"Found %d dead redis workers", len(deadRedisWorkers))
 
-		glog.V(2).Infof("Found %d redis workers", len(redisWorkers))
-		glog.V(2).Info(redisWorkers)
-
-		glog.V(2).Infof("Found %d dead redis workers", len(deadRedisWorkers))
-		glog.V(2).Info(deadRedisWorkers)
-
-		for _, redisWorker := range deadRedisWorkers {
+	for _, redisWorker := range deadRedisWorkers {
+		log.Printf("info - "+"Dead worker: %s", redisWorker.name)
+		if run == "1" {
 			if err := removeDeadRedisWorker(redisClient, redisWorker); err != nil {
-				glog.Warning(errors.Wrap(err, fmt.Sprintf("Unable to delete %s", redisWorker)).Error())
+				log.Fatalf(errors.Wrap(err, fmt.Sprintf("Unable to delete %s", redisWorker)).Error())
 			}
 		}
-
-		failedResqueJobs, err := getDirtyExitFailedJobsFromRedis(redisClient)
-		if err != nil {
-			glog.Warning(errors.Wrap(err, "Unable to get failed jobs from redis").Error())
-			continue
-		}
-
-		glog.V(2).Infof("Found %d failed resque jobs", len(failedResqueJobs))
-		glog.V(2).Info(failedResqueJobs)
-
-		for _, failedResqueJob := range failedResqueJobs {
-			if err := removeFailedResqueJob(redisClient, failedResqueJob); err != nil {
-				glog.Warning(errors.Wrap(err, "Unable to retry failed resque job").Error())
-			}
-		}
-
-		glog.V(1).Infof("finished cleanup at %v...", time.Now())
-	}
-}
-
-func getKubernetesClient() (*kube_client.Client, error) {
-	certsPath := os.Getenv("CERTS_PATH")
-	serviceHost := os.Getenv("KUBERNETES_SERVICE_HOST")
-	servicePort := os.Getenv("KUBERNETES_SERVICE_PORT")
-	config, err := kubeconfig.NewKubernetesConfig(certsPath, serviceHost, servicePort)
-	if err != nil {
-		return nil, errors.Wrap(err, "Unable to create kubernetes config")
 	}
 
-	return kube_client.New(config)
+	// failedResqueJobs, err := getDirtyExitFailedJobsFromRedis(redisClient)
+	// if err != nil {
+	// 	log.Fatalf(errors.Wrap(err, "Unable to get failed jobs from redis").Error())
+	// }
+
+	// log.Printf("info - "+"Found %d failed resque jobs", len(failedResqueJobs))
+
+	// for _, failedResqueJob := range failedResqueJobs {
+	// 	log.Printf("info - "+"failed job: %s", failedResqueJob.name)
+	// 	if run == "1" {
+	// 		if err := removeFailedResqueJob(redisClient, failedResqueJob); err != nil {
+	// 			log.Fatalf(errors.Wrap(err, "Unable to retry failed resque job").Error())
+	// 		}
+	// 	}
+	// }
+
+	log.Printf("info - "+"finished cleanup at %v...", time.Now())
 }
 
-func getWorkersFromKubernetes(podLister *kube_util.ScheduledPodLister) ([]string, error) {
-	pods, err := podLister.List()
+func getKubernetesClient() (*kubernetes.Clientset, error) {
+	k8sConfig, err := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG_FILE"))
 	if err != nil {
-		return []string{}, errors.Wrap(err, "Unable to list pods")
+		return nil, err
+	}
+	k8sClient, err := kubernetes.NewForConfig(k8sConfig)
+	if err != nil {
+		return nil, err
+	}
+	return k8sClient, nil
+}
+
+func getWorkersFromKubernetes(namespace string, client *kubernetes.Clientset) ([]string, error) {
+	podlist, err := client.Pods(namespace).List(api.ListOptions{})
+	if err != nil {
+		return nil, err
 	}
 
 	var podNames []string
-	for _, pod := range pods {
-		if pod.Labels["role"] == podRoleSelector && pod.Labels["app"] == podAppSelector && pod.Namespace == namespace {
+	for _, pod := range podlist.Items {
+		if pod.Labels["app"] == podAppSelector && pod.Namespace == namespace {
 			podNames = append(podNames, pod.Name)
 		}
 	}
@@ -143,18 +135,13 @@ func getWorkersFromRedis(redisClient *redis.Client) ([]redisWorker, error) {
 	}
 
 	var redisWorkers []redisWorker
-OUTER:
+
 	for _, worker := range workers {
 		workerName := strings.SplitN(worker, ":", 2)[0]
-		queueName := strings.SplitN(worker, ":", 2)[1]
 
-		for _, blacklistedQueue := range blacklistedResqueQueues {
-			if strings.Contains(blacklistedQueue, queueName) || strings.Contains(queueName, blacklistedQueue) {
-				continue OUTER
-			}
+		if strings.HasPrefix(workerName, matchPrefix) {
+			redisWorkers = append(redisWorkers, redisWorker{workerName, worker})
 		}
-
-		redisWorkers = append(redisWorkers, redisWorker{workerName, worker})
 	}
 
 	return redisWorkers, nil
@@ -213,18 +200,18 @@ OUTER:
 }
 
 func removeDeadRedisWorker(redisClient *redis.Client, redisWorker redisWorker) error {
-	bytes, err := redisClient.Get(fmt.Sprintf("%s:%s", resqueWorkerKey, redisWorker.info)).Bytes()
-	if err != nil && err != redis.Nil {
-		return errors.Wrap(err, fmt.Sprintf("Error getting %s from redis", redisWorker))
-	}
-	if err != nil && err == redis.Nil {
-		// Redis key not present so the issue probably corrected itself
-		return nil
-	}
+	// bytes, err := redisClient.Get(fmt.Sprintf("%s:%s", resqueWorkerKey, redisWorker.info)).Bytes()
+	// if err != nil && err != redis.Nil {
+	// 	return errors.Wrap(err, fmt.Sprintf("Error getting %s from redis", redisWorker))
+	// }
+	// if err != nil && err == redis.Nil {
+	// 	// Redis key not present so the issue probably corrected itself
+	// 	return nil
+	// }
 
-	if err := retryDeadWorker(redisClient, bytes); err != nil {
-		return errors.Wrap(err, fmt.Sprintf("Unable to retry %s", redisWorker))
-	}
+	// if err := retryDeadWorker(redisClient, bytes); err != nil {
+	// 	return errors.Wrap(err, fmt.Sprintf("Unable to retry %s", redisWorker))
+	// }
 
 	redisClient.Pipelined(func(pipe *redis.Pipeline) error {
 		pipe.SRem(resqueWorkersKey, redisWorker.info)
@@ -258,7 +245,7 @@ func retryDeadWorker(redisClient *redis.Client, workerData []byte) error {
 		return errors.Wrap(err, "Unable to deserialize job")
 	}
 
-	glog.V(3).Infof("Going to retry job on queue: %s, with payload: %s", resqueJob.Queue, resqueJob.Payload)
+	log.Printf("info - "+"Going to retry job on queue: %s, with payload: %s", resqueJob.Queue, resqueJob.Payload)
 
 	if err := redisClient.SAdd(resqueQueuesKey, resqueJob.Queue).Err(); err != nil {
 		return errors.Wrap(err, fmt.Sprintf("Unable to create resque queue %s", resqueJob.Queue))
@@ -288,15 +275,8 @@ type resqueJob struct {
 }
 
 func getRedisClient() *redis.Client {
-	if kube == "true" {
-		addr := fmt.Sprintf("%s:%s", os.Getenv("REDIS_SENTINEL_SERVICE_HOST"), os.Getenv("REDIS_SENTINEL_SERVICE_PORT"))
-		return redis.NewFailoverClient(&redis.FailoverOptions{
-			MasterName:    "mymaster",
-			SentinelAddrs: []string{addr},
-		})
-	} else {
-		return redis.NewClient(&redis.Options{
-			Addr: "localhost:6379",
-		})
-	}
+	addr := fmt.Sprintf("%s:%s", os.Getenv("REDIS_SERVICE_HOST"), os.Getenv("REDIS_SERVICE_PORT"))
+	return redis.NewClient(&redis.Options{
+		Addr: addr,
+	})
 }
